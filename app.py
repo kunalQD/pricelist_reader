@@ -27,7 +27,7 @@ else:
         selected_file = [file for file, brand in brand_map.items() if brand == selected_brand][0]
 
         # ✅ Use second row (index 1) as header
-        df = pd.read_csv(selected_file, header=1)
+        df = pd.read_csv(selected_file)
 
         # Search input
         query = st.text_input("Search for an item")

@@ -1,4 +1,4 @@
-# streamlit_app_pricelist_pipeline_with_postprocess.py
+# streamlit_app_pricelist_pipeline_general_text_parser.py
 import io
 import os
 import re
@@ -6,7 +6,7 @@ import csv
 import json
 import math
 from datetime import datetime
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 import pandas as pd
 import streamlit as st
 
@@ -21,7 +21,7 @@ FALLBACK_MODELS_DEFAULT = "gemini-2.5-flash,gemini-2.5-pro,gemini-2.1,gemini-1.5
 DEFAULT_MRP_FORMULA = "CUT * 2.5 * 1.05"
 # -----------------------------------------------------------------------------------
 
-# Optional libraries availability checks
+# Optional libs
 try:
     import pdfplumber
     PDFPLUMBER_AVAILABLE = True
@@ -57,11 +57,11 @@ def has_ocr_libs():
     except Exception:
         return False
 
-# ---------------- Streamlit layout ----------------
+# ---------------- Streamlit setup ----------------
 st.set_page_config(page_title="Pricelist Pipeline", layout="wide")
 st.title("Pricelist Pipeline")
 
-# Navigation: Viewer default
+# front page viewer default
 view_mode = st.radio("Choose View", options=["Pricelist Viewer", "Pricelist Pipeline"], index=0, horizontal=True)
 
 BRAND_OPTIONS = [
@@ -80,7 +80,7 @@ def numeric_from_series(s: pd.Series) -> pd.Series:
         errors="coerce"
     )
 
-# --- Low-level Gemini caller (tries candidate models) ---
+# --- Gemini low-level caller (tries candidate models) ---
 def gemini_generate_raw(prompt_text: str, preferred_model: str = None, fallback_models: list = None) -> Tuple[str, str]:
     if not GENAI_AVAILABLE:
         raise RuntimeError("google.generativeai not installed.")
@@ -190,7 +190,7 @@ def try_parse_csv_text_to_df(text: str) -> Tuple[Optional[pd.DataFrame], Optiona
         pass
     return None, None
 
-# ---------- pdfplumber -> postprocess helpers ----------
+# ---------- pdfplumber table extractor ----------
 def try_pdfplumber_tables(file_bytes: bytes) -> Optional[pd.DataFrame]:
     if not PDFPLUMBER_AVAILABLE:
         return None
@@ -235,6 +235,7 @@ def try_pdfplumber_tables(file_bytes: bytes) -> Optional[pd.DataFrame]:
     except Exception:
         return None
 
+# ---------- postprocess pdfplumber wide tables (kept as fallback) ----------
 def postprocess_pdfplumber_df(df_raw: pd.DataFrame, min_numeric_ratio=0.5) -> Optional[pd.DataFrame]:
     if df_raw is None or df_raw.empty:
         return None
@@ -246,7 +247,6 @@ def postprocess_pdfplumber_df(df_raw: pd.DataFrame, min_numeric_ratio=0.5) -> Op
     df = df[non_empty_cols].copy()
     if df.shape[1] == 0:
         return None
-    # transpose heuristic
     if df.shape[1] > df.shape[0] and df.shape[0] <= 10:
         try:
             df_t = df.transpose().reset_index(drop=True)
@@ -267,7 +267,6 @@ def postprocess_pdfplumber_df(df_raw: pd.DataFrame, min_numeric_ratio=0.5) -> Op
         numeric_candidates = sorted(col_scores.items(), key=lambda x: x[1], reverse=True)
         numeric_cols = [c for c, sc in numeric_candidates if sc > 0][:2]
         non_numeric_cols = [c for c in df.columns if c not in numeric_cols]
-    # build leading non-numeric block
     cols_list = list(df.columns)
     lead_non_numeric = []
     for c in cols_list:
@@ -281,7 +280,6 @@ def postprocess_pdfplumber_df(df_raw: pd.DataFrame, min_numeric_ratio=0.5) -> Op
         parts = [str(row[c]).strip() for c in lead_non_numeric if str(row[c]).strip()]
         return " | ".join(parts).strip()
     df["Catalogue"] = df.apply(merge_catalogue_row, axis=1)
-    # find cut_cols to the right of leading text
     try:
         last_text_col_idx = max([df.columns.get_loc(c) for c in lead_non_numeric]) if lead_non_numeric else -1
     except Exception:
@@ -317,7 +315,177 @@ def postprocess_pdfplumber_df(df_raw: pd.DataFrame, min_numeric_ratio=0.5) -> Op
             df_clean[c] = pd.to_numeric(df_clean[c], errors="coerce")
     return df_clean.reset_index(drop=True)
 
-# ---------- Gemini JSON + OCR helpers ----------
+# ---------- text-first general parser (NEW) ----------
+def parse_structured_text_rows(text: str) -> Optional[pd.DataFrame]:
+    """
+    General text-based parser for line-oriented price lists.
+    Heuristics:
+      - Split text into lines, collapse repeated headers.
+      - Identify contiguous 'record' lines: those containing >= 2 numeric tokens (rates).
+      - For multi-line catalogue names, merge lines until a numeric token appears.
+      - Extract tokens using regex: NAME then numbers: CUT, ROLL, WIDTH (like 54"), HSN, GST, optional FILE_COST.
+    Returns DataFrame with columns:
+      Catalogue, CUT_RATE, ROLL_RATE, WIDTH, HSN_CODE, GST, FILE_COST (where available)
+    """
+    if not text:
+        return None
+    # normalize whitespace and replace Unicode non-breaking spaces
+    text = text.replace("\xa0", " ").replace("\u200b", "")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return None
+
+    # remove obvious repeated header lines (heuristic)
+    header_candidates = []
+    cleaned_lines = []
+    for ln in lines:
+        low = ln.lower()
+        if any(h in low and len(low.split()) < 8 for h in ("cut", "roll", "rate", "hsn", "gst", "width", "catalog")):
+            # treat as header line — store for possible use but skip in records
+            header_candidates.append(ln)
+            continue
+        cleaned_lines.append(ln)
+
+    # merge broken lines: when a line does NOT contain any numeric token but next line does,
+    # it's likely part of the catalogue name -> append to next line
+    merged_lines = []
+    buffer = None
+    numeric_re = re.compile(r"(?<!\w)(?:\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+\.\d+|\d+)(?:\"|''|”)?")  # matches numbers and numbers with "
+    for ln in cleaned_lines:
+        if buffer is None:
+            buffer = ln
+        else:
+            # if buffer already has numeric tokens, push it and start new
+            if numeric_re.search(buffer):
+                merged_lines.append(buffer)
+                buffer = ln
+            else:
+                # buffer has no numbers; merge with current line (part of name)
+                buffer = buffer + " " + ln
+    if buffer:
+        merged_lines.append(buffer)
+
+    # Now, consider each merged_line: lines that contain >=2 numeric tokens are records
+    records = []
+    for ln in merged_lines:
+        nums = numeric_re.findall(ln)
+        if len(nums) >= 2:
+            # attempt structured extraction:
+            # pattern: <name> <num1> <num2> <width?> <hsn?> <gst%?> <optional filecost?>
+            # We'll split tokens while keeping quoted widths like 54"
+            # First, find numeric tokens with their spans to separate name from numbers
+            num_spans = [(m.group(0), m.start(), m.end()) for m in numeric_re.finditer(ln)]
+            first_num_pos = num_spans[0][1]
+            name_token = ln[:first_num_pos].strip(" -|:,.")
+            # tokens after name
+            tail = ln[first_num_pos:].strip()
+            # split tail by whitespace but keep width tokens (like 54")
+            tail_parts = re.split(r"\s+", tail)
+            # normalize parts: remove commas from numbers
+            def norm_num(tok):
+                return tok.replace(",", "").strip().strip('"').strip("'").strip("”")
+            # collect candidates
+            # heuristics: first numeric = CUT, second = ROLL, third maybe width (contains "), maybe HSN (6 digits), GST contains %
+            cut = roll = width = hsn = gst = filecost = None
+            # find numeric-like tokens among tail_parts in order (keep tokens with digits)
+            digit_parts = [p for p in tail_parts if re.search(r"\d", p)]
+            if digit_parts:
+                # assign
+                if len(digit_parts) >= 1:
+                    cut = norm_num(digit_parts[0])
+                if len(digit_parts) >= 2:
+                    roll = norm_num(digit_parts[1])
+                # search remaining tokens for width (contains ")
+                for p in digit_parts[2:]:
+                    if '"' in p or "inch" in p.lower() or re.search(r'\d{2}"', p):
+                        width = p.replace("”", '"').strip()
+                        continue
+                    # HSN: often 6 digits
+                    if re.fullmatch(r"\d{6}", re.sub(r"[^\d]", "", p)):
+                        hsn = re.sub(r"[^\d]", "", p)
+                        continue
+                    # GST: contains %
+                    if "%" in p:
+                        gst = p.strip()
+                        continue
+                # optional filecost may be trailing numeric > 3 digits
+                if len(digit_parts) >= 3:
+                    # heuristic: if there are more numeric tokens beyond the first two, pick last numeric as possible file cost if it looks large
+                    last_num = norm_num(digit_parts[-1])
+                    try:
+                        if last_num and float(last_num) > 1000:
+                            filecost = last_num
+                    except Exception:
+                        pass
+            # finalize record
+            record = {
+                "Catalogue": name_token if name_token else ln,
+                "CUT_RATE": try_parse_float_or_none(cut),
+                "ROLL_RATE": try_parse_float_or_none(roll),
+                "WIDTH": normalize_width(width),
+                "HSN_CODE": hsn,
+                "GST": normalize_gst(gst),
+                "FILE_COST": try_parse_float_or_none(filecost)
+            }
+            records.append(record)
+        else:
+            # not enough numeric tokens - skip or treat as catalog-only row (rare)
+            # we'll append a record with only Catalogue if beneficial (skip for now)
+            pass
+
+    if not records:
+        return None
+    df = pd.DataFrame(records)
+    # clean columns: ensure Catalogues stripped and unique rows kept
+    df["Catalogue"] = df["Catalogue"].astype(str).str.replace(r"\s{2,}", " ", regex=True).str.strip()
+    # drop empty rows (no catalogue and no numeric)
+    df = df[~((df["Catalogue"].astype(str).str.strip() == "") & (df[["CUT_RATE", "ROLL_RATE"]].isna().all(axis=1)))]
+    if df.empty:
+        return None
+    # sometimes CUT_RATE is missing but ROLL_RATE present - fill CUT with ROLL in that case
+    df["CUT_RATE"] = df.apply(lambda r: r["ROLL_RATE"] if pd.isna(r["CUT_RATE"]) and not pd.isna(r["ROLL_RATE"]) else r["CUT_RATE"], axis=1)
+    # reset index
+    return df.reset_index(drop=True)
+
+# small helpers used by text parser
+def try_parse_float_or_none(s):
+    if s is None:
+        return None
+    try:
+        s2 = str(s).replace(",", "").strip()
+        if s2 == "":
+            return None
+        return float(re.sub(r"[^\d.\-]", "", s2))
+    except Exception:
+        return None
+
+def normalize_width(s):
+    if not s:
+        return None
+    s = str(s).strip().replace("”", '"')
+    # keep forms like 54", 48", 2.5m etc.
+    m = re.search(r'(\d{1,3}(?:\.\d+)?\s*("|in|inch|inches)?)', s, flags=re.I)
+    if m:
+        return m.group(1).replace(" ", "")
+    # fallback: digits
+    m2 = re.search(r'(\d{1,3}(?:\.\d+)?)', s)
+    if m2:
+        return m2.group(1)
+    return s
+
+def normalize_gst(s):
+    if not s:
+        return None
+    s = str(s).strip()
+    if "%" in s:
+        return s
+    # maybe '5' -> '5%'
+    m = re.search(r'\d+(\.\d+)?', s)
+    if m:
+        return m.group(0) + "%"
+    return s
+
+# ---------- Gemini JSON / OCR helpers (kept) ----------
 def gemini_json_parse_from_text(text: str, preferred_model: str=None, fallback_models: list=None) -> Tuple[Optional[pd.DataFrame], str, str]:
     json_prompt = f"""
 You are a JSON-only parser for vendor price lists. Convert the RAW TEXT into a JSON array ONLY.
@@ -376,16 +544,18 @@ def ocr_pdf_to_df(file_bytes: bytes) -> Optional[pd.DataFrame]:
         return pd.DataFrame(normalized, columns=headers)
     return None
 
+# ---------- Top-level robust parse (text-first) ----------
 def robust_parse_pdf(file_bytes: bytes, preferred_model: str=None, fallback_models: list=None, allow_ocr: bool=False) -> Tuple[Optional[pd.DataFrame], str, Optional[str]]:
-    # 1) try pdfplumber tables + postprocess
-    df_pdf = try_pdfplumber_tables(file_bytes)
-    if df_pdf is not None and df_pdf.shape[0] > 0 and df_pdf.shape[1] >= 2:
-        df_clean = postprocess_pdfplumber_df(df_pdf)
-        if df_clean is not None and not df_clean.empty:
-            return df_clean, "pdfplumber_tables_postprocessed", None
-        # else fallthrough to Gemini/ocr
-    # 2) try extracting text and using Gemini JSON
+    """
+    Parsing order (text-first general approach):
+      1) extract text (pdfplumber) -> run parse_structured_text_rows(text)
+      2) if text parser fails, try pdfplumber table extractor + postprocess
+      3) gemini json parse of extracted text
+      4) optional OCR fallback
+    Returns (df_or_none, method_str, debug_raw_text_if_any)
+    """
     extracted_text = None
+    # 1) extract text via pdfplumber if available
     if PDFPLUMBER_AVAILABLE:
         try:
             with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
@@ -393,21 +563,39 @@ def robust_parse_pdf(file_bytes: bytes, preferred_model: str=None, fallback_mode
             extracted_text = "\n\n".join(pages_text).strip()
         except Exception:
             extracted_text = None
+
+    # If we have extracted text, run the general text parser first
     if extracted_text:
+        df_text = parse_structured_text_rows(extracted_text)
+        if df_text is not None and not df_text.empty:
+            return df_text, "text_parser_structured_rows", extracted_text
+
+    # 2) try pdfplumber tables + postprocess (fallback)
+    df_pdf = try_pdfplumber_tables(file_bytes)
+    if df_pdf is not None:
+        df_clean = postprocess_pdfplumber_df(df_pdf)
+        if df_clean is not None and not df_clean.empty:
+            return df_clean, "pdfplumber_tables_postprocessed", None
+
+    # 3) try Gemini JSON on extracted text (if allowed / available)
+    if extracted_text and GENAI_AVAILABLE:
         df_gem, method_or_msg, raw_text = gemini_json_parse_from_text(extracted_text, preferred_model=preferred_model, fallback_models=fallback_models)
         if df_gem is not None:
             return df_gem, method_or_msg, raw_text
         else:
+            # if Gemini failed and OCR not enabled, return failure with gemini raw text for debugging
             if not allow_ocr:
                 return None, method_or_msg, raw_text
-    # 3) OCR fallback
+
+    # 4) OCR fallback
     if allow_ocr and has_ocr_libs():
         df_ocr = ocr_pdf_to_df(file_bytes)
         if df_ocr is not None:
             return df_ocr, "ocr_fallback", None
+
     return None, "no_parse_succeeded", extracted_text
 
-# ---------------- MongoDB client (hardcoded) ----------------
+# ---------------- MongoDB client ----------------
 mongo_client = None
 if PYMONGO_AVAILABLE and MONGO_URI:
     try:
@@ -503,6 +691,7 @@ uploaded = st.file_uploader("Upload vendor pricelist (PDF / CSV / Excel)", type=
 if not uploaded:
     st.info("Upload a file to begin.")
     st.stop()
+
 filename = uploaded.name
 file_bytes = uploaded.read()
 extracted_text = None
@@ -529,8 +718,9 @@ else:
             prelim_df = sheets[chosen]
 
 st.header("Parse / Clean")
-st.write("Parsing flow: pdfplumber tables → postprocess → Gemini JSON → optional OCR fallback (if enabled).")
+st.write("Parsing flow: text-first parser → pdfplumber tables postprocess → Gemini JSON → optional OCR fallback.")
 parse_btn = st.button("Parse (robust)")
+
 if parse_btn:
     with st.spinner("Parsing..."):
         df_parsed, method, debug_raw = robust_parse_pdf(file_bytes, preferred_model=preferred_model if use_gemini else None, fallback_models=fallback_models, allow_ocr=allow_ocr)
@@ -556,13 +746,16 @@ if 'parsed_df' not in st.session_state:
     st.info("Parsed table not available yet. Click Parse (robust) or upload CSV/XLSX.")
     st.stop()
 
+# Map columns & calculate MRP
 df = st.session_state['parsed_df'].copy()
 st.header("Map Columns & Calculate MRP")
 st.write("Select Catalogue/Model column and one or more numeric columns (CUT) to compute MRP.")
 df.columns = [str(c).strip() for c in df.columns]
+
 def guess_name_cols(df_):
     keys = ["model", "name", "catalog", "catalogue", "desc", "description", "item", "product"]
     return [c for c in df_.columns if any(re.search(rf"\b{kw}\b", str(c), flags=re.I) for kw in keys)]
+
 def guess_numeric_cols(df_):
     numeric_scores = []
     for c in df_.columns:
@@ -573,8 +766,10 @@ def guess_numeric_cols(df_):
             numeric_scores.append((c, 0))
     numeric_scores.sort(key=lambda x: x[1], reverse=True)
     return [c for c, _ in numeric_scores if _ > 0]
+
 name_candidates = guess_name_cols(df)
 numeric_candidates = guess_numeric_cols(df)
+
 catalogue_col = st.selectbox("Catalogue / Model column", options=(name_candidates + [c for c in df.columns if c not in name_candidates]))
 cut_cols = st.multiselect("Select one or more numeric CUT columns", options=(numeric_candidates + [c for c in df.columns if c not in numeric_candidates]))
 if not cut_cols:
@@ -584,19 +779,23 @@ if not cut_cols:
 df_work = df.copy()
 for cut_col in cut_cols:
     df_work[f"_CUTNUM__{cut_col}"] = numeric_from_series(df_work[cut_col])
+
 def safe_eval_mrp(cut_value, formula_text):
     safe_locals = {"CUT": cut_value, "math": math, "round": round, "int": int}
     try:
         return eval(formula_text, {"__builtins__": {}}, safe_locals)
     except Exception:
         return None
+
 for cut_col in cut_cols:
     df_work[f"MRP_{cut_col}"] = df_work[f"_CUTNUM__{cut_col}"].apply(lambda x: safe_eval_mrp(x, mrp_formula) if pd.notna(x) else None)
 
 preview = pd.DataFrame({"Catalogue": df_work[catalogue_col].astype(str).fillna("")})
 for c in cut_cols:
     preview[f"MRP_{c}"] = df_work[f"MRP_{c}"]
+
 preview.insert(0, "SNO", range(1, len(preview) + 1))
+
 def normalize_mrp(v):
     try:
         if v is None or (isinstance(v, float) and pd.isna(v)):
@@ -604,6 +803,7 @@ def normalize_mrp(v):
         return int(float(v))
     except Exception:
         return None
+
 for c in cut_cols:
     preview[f"MRP_{c}"] = preview[f"MRP_{c}"].apply(normalize_mrp)
 
@@ -612,6 +812,7 @@ st.dataframe(preview.set_index("SNO"), use_container_width=True)
 
 st.header("Save to MongoDB")
 brand_sel = st.selectbox("Select Brand to save under", options=BRAND_OPTIONS)
+
 if st.button("Save final pricelist to MongoDB (upsert by brand)"):
     if not PYMONGO_AVAILABLE or not mongo_client:
         st.error("MongoDB not available. Check pymongo and MONGO_URI.")

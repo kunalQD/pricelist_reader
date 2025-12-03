@@ -1,0 +1,29 @@
+# Core
+streamlit>=1.25.0
+pandas>=1.5.3
+numpy>=1.24.0
+
+# PDF parsing & tables
+pdfplumber>=0.8.0
+pdf2image>=1.16.0        # optional - required for OCR fallback
+
+# OCR (optional)
+pytesseract>=0.3.10      # wrapper; requires Tesseract binary installed on your system
+Pillow>=9.5.0
+
+# Google Gemini / GenAI SDKs (include both legacy & newer SDKs to support either import style)
+google-generativeai>=0.8.5
+google-genai>=0.1.0
+
+# MongoDB
+pymongo>=4.3.0
+
+# PDF/print export
+reportlab>=3.6.12
+
+# Excel support for pandas
+openpyxl>=3.1.1
+xlrd>=2.0.1
+
+# Utilities (helps with parsing)
+python-dotenv>=1.0.0
